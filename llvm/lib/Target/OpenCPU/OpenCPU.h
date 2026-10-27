@@ -9,6 +9,10 @@
 #include "OpenCPUGenSubtargetInfo.inc"
 namespace llvm {
 class Twine;
+class Module;
+class ModulePass;
+unsigned getOpenCPUDataEnd(const Module &);
+ModulePass *createOpenCPUPreparePass();
 [[noreturn]] void reportOpenCPUError(const Twine &Message);
 }
 #endif

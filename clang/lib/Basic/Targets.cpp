@@ -26,6 +26,7 @@
 #include "Targets/LoongArch.h"
 #include "Targets/M68k.h"
 #include "Targets/MSP430.h"
+#include "Targets/OpenCPU.h"
 #include "Targets/Mips.h"
 #include "Targets/NVPTX.h"
 #include "Targets/OSTargets.h"
@@ -281,6 +282,8 @@ std::unique_ptr<TargetInfo> AllocateTarget(const llvm::Triple &Triple,
   case llvm::Triple::bpfel:
     return std::make_unique<BPFTargetInfo>(Triple, Opts);
 
+  case llvm::Triple::opencpu:
+    return std::make_unique<OpenCPUTargetInfo>(Triple, Opts);
   case llvm::Triple::msp430:
     return std::make_unique<MSP430TargetInfo>(Triple, Opts);
 

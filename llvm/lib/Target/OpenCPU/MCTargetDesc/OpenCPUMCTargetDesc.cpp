@@ -20,7 +20,8 @@ using namespace llvm;
 namespace {
 class OpenCPUAsmInfo : public MCAsmInfoELF {
 public:
-  explicit OpenCPUAsmInfo(const MCTargetOptions &Options) : MCAsmInfoELF(Options) {
+  explicit OpenCPUAsmInfo(const Triple &TT, const MCTargetOptions &Options) : MCAsmInfoELF(Options) {
+    ExceptionsType = TT.getDefaultExceptionHandling();
     CodePointerSize = 2;
     CalleeSaveStackSlotSize = 2;
     CommentString = ";";
@@ -68,7 +69,7 @@ public:
 };}
 extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeOpenCPUTargetMC() {
   Target &T = getTheOpenCPUTarget();
-  TargetRegistry::RegisterMCAsmInfo(T, [](const MCRegisterInfo &, const Triple &, const MCTargetOptions &Options) -> MCAsmInfo * { return new OpenCPUAsmInfo(Options); });
+  TargetRegistry::RegisterMCAsmInfo(T, [](const MCRegisterInfo &, const Triple &TT, const MCTargetOptions &Options) -> MCAsmInfo * { return new OpenCPUAsmInfo(TT, Options); });
   TargetRegistry::RegisterMCInstrInfo(T, []() { auto *I = new MCInstrInfo; InitOpenCPUMCInstrInfo(I); return I; });
   TargetRegistry::RegisterMCRegInfo(T, [](const Triple &) { auto *I = new MCRegisterInfo; InitOpenCPUMCRegisterInfo(I, OpenCPU::RA); return I; });
   TargetRegistry::RegisterMCSubtargetInfo(T, [](const Triple &TT, StringRef CPU, StringRef FS) { if (CPU.empty()) CPU = "generic"; return createOpenCPUMCSubtargetInfoImpl(TT, CPU, CPU, FS); });

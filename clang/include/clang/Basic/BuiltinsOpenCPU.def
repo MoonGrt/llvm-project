@@ -1,0 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+BUILTIN(__builtin_opencpu_mmio_read16, "UiUi", "n")
+BUILTIN(__builtin_opencpu_mmio_write16, "vUiUi", "n")
+#undef BUILTIN

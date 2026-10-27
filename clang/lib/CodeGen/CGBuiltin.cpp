@@ -28,6 +28,7 @@
 #include "clang/AST/StmtVisitor.h"
 #include "clang/Basic/DiagnosticFrontend.h"
 #include "clang/Basic/TargetInfo.h"
+#include "clang/Basic/TargetBuiltins.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Instruction.h"
@@ -133,6 +134,20 @@ static Value *EmitTargetArchBuiltinExpr(CodeGenFunction *CGF,
     [[fallthrough]];
   case llvm::Triple::spirv:
     return CGF->EmitSPIRVBuiltinExpr(BuiltinID, E);
+  case llvm::Triple::opencpu: {
+    bool Read = BuiltinID == clang::OpenCPU::BI__builtin_opencpu_mmio_read16;
+    if (!Read && BuiltinID != clang::OpenCPU::BI__builtin_opencpu_mmio_write16)
+      return nullptr;
+    llvm::SmallVector<llvm::Value *, 2> Args;
+    for (const auto *Arg : E->arguments()) Args.push_back(CGF->EmitScalarExpr(Arg));
+    auto *I16 = llvm::Type::getInt16Ty(CGF->getLLVMContext());
+    auto *Ret = Read ? I16 : llvm::Type::getVoidTy(CGF->getLLVMContext());
+    llvm::SmallVector<llvm::Type *, 2> Types(Args.size(), I16);
+    auto Fn = CGF->CGM.getModule().getOrInsertFunction(
+        Read ? "__opencpu_mmio_read16" : "__opencpu_mmio_write16",
+        llvm::FunctionType::get(Ret, Types, false));
+    return CGF->Builder.CreateCall(Fn, Args);
+  }
   case llvm::Triple::avr:
     return CGF->EmitAVRBuiltinExpr(BuiltinID, E);
   default:

@@ -3,7 +3,7 @@
 ; CHECK-LABEL: main:
 ; CHECK: sw fp, 0(sp)
 ; CHECK: sw ra, 1(sp)
-; CHECK: addi fp,
+; CHECK: slli
 ; CHECK: sw
 ; CHECK: lw
 ; CHECK: lw ra, 1(sp)

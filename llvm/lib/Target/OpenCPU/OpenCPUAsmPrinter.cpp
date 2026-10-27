@@ -13,6 +13,7 @@ using namespace llvm;
 namespace llvm {
 class OpenCPUAsmPrinter : public AsmPrinter {
   uint64_t NextSkip = 0;
+  bool PrintedMetadata = false;
   std::string blockLabel(const MachineBasicBlock &BB) const {
     return (Twine(".Locpu") + Twine(BB.getParent()->getFunctionNumber()) + "_" + Twine(BB.getNumber())).str();
   }
@@ -38,10 +39,14 @@ public:
   StringRef getPassName() const override { return "OpenCPU flat word assembly printer"; }
   // This flat-image ABI has no object sections, DWARF or global data. Emit
   // only final allocated machine instructions through the MC text streamer.
-  bool doInitialization(Module &) override { return false; }
+  bool doInitialization(Module &) override { PrintedMetadata = false; return false; }
   bool doFinalization(Module &) override { OutStreamer->finish(); return false; }
   bool runOnMachineFunction(MachineFunction &Function) override {
     MF = &Function;
+    if (!PrintedMetadata) {
+      line("# opencpu-data-size: " + Twine(getOpenCPUDataEnd(*Function.getFunction().getParent())));
+      PrintedMetadata = true;
+    }
     line(Function.getName() + ":");
     for (MachineBasicBlock &BB : Function) {
       line(blockLabel(BB) + ":");
@@ -60,6 +65,33 @@ void OpenCPUAsmPrinter::emitInstruction(const MachineInstr *MI) {
   case OpenCPU::OR: Name = "or"; break; case OpenCPU::XOR: Name = "xor"; break;
   case OpenCPU::SHL: Name = "sll"; break; case OpenCPU::SRL: Name = "srl"; break;
   case OpenCPU::LI: line("    li " + O(0) + ", " + O(1)); return;
+  case OpenCPU::FRAMEADDR: {
+    line("    mov " + O(0) + ", " + O(1));
+    line("    slli " + O(0) + ", 1");
+    int64_t Bytes = MI->getOperand(2).getImm();
+    while (Bytes) {
+      int64_t Part = std::clamp<int64_t>(Bytes, -128, 127);
+      line("    addi " + O(0) + ", " + Twine(Part)); Bytes -= Part;
+    }
+    return;
+  }
+  case OpenCPU::CHECKSP: {
+    std::string Fail = (Twine(".LocpuStackFail") + Twine(NextSkip++)).str();
+    std::string Done = Fail + "Done";
+    int64_t Limit = MI->getOperand(0).getImm();
+    auto Adjust = [&](int64_t Amount) {
+      while (Amount) {
+        int64_t Part = std::clamp<int64_t>(Amount, -128, 127);
+        line("    addi sp, " + Twine(Part)); Amount -= Part;
+      }
+    };
+    Adjust(-Limit);
+    line("    blt sp, zero, " + Fail);
+    Adjust(Limit);
+    line("    j " + Done);
+    line(Fail + ":"); line("    .word 14"); line(Done + ":");
+    return;
+  }
   case OpenCPU::MOV: line("    mov " + O(0) + ", " + O(1)); return;
   case OpenCPU::ADDI: line("    addi " + O(0) + ", " + O(2)); return;
   case OpenCPU::LOAD: line("    lw " + O(0) + ", " + O(2) + "(" + O(1) + ")"); return;

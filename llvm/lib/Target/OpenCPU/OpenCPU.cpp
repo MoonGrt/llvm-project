@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-// OpenCPU ISA v2 native LLVM code generator. The initial ABI deliberately
-// permits only non-escaping, aligned i16 frame objects; it does not pretend
-// that the machine's word pointers are arbitrary LLVM byte pointers.
+// OpenCPU ISA v2 native LLVM code generator. ABI v2 exposes byte-addressed
+// C data pointers while the hardware stack and memory ports use word addresses.
 #include "OpenCPU.h"
 #include "TargetInfo/OpenCPUTargetInfo.h"
 #include "llvm/ADT/BitVector.h"
@@ -26,6 +25,9 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Transforms/Utils.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/IPO/GlobalDCE.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/TargetRegistry.h"
@@ -53,7 +55,6 @@ namespace llvm {
 [[noreturn]] void reportOpenCPUError(const Twine &Message) {
   report_fatal_error(Twine("OpenCPU: ") + Message, false);
 }
-constexpr const char *Layout = "e-p:16:16-i16:16-n16-S16";
 constexpr MCPhysReg ArgRegs[] = {OpenCPU::A1, OpenCPU::A2, OpenCPU::A3, OpenCPU::A4};
 
 class OpenCPUTargetMachine;
@@ -85,7 +86,7 @@ public:
 class OpenCPUInstrInfo : public OpenCPUGenInstrInfo {
   OpenCPURegisterInfo RI;
 public:
-  explicit OpenCPUInstrInfo(const TargetSubtargetInfo &ST) : OpenCPUGenInstrInfo(ST, RI) {}
+  explicit OpenCPUInstrInfo(const TargetSubtargetInfo &ST) : OpenCPUGenInstrInfo(ST, RI, OpenCPU::ADJCALLSTACKDOWN, OpenCPU::ADJCALLSTACKUP) {}
   const OpenCPURegisterInfo &getRegisterInfo() const { return RI; }
   void copyPhysReg(MachineBasicBlock &, MachineBasicBlock::iterator, const DebugLoc &,
                    Register, Register, bool, bool = false, bool = false) const override;
@@ -110,11 +111,12 @@ public:
   OpenCPUFrameLowering() : TargetFrameLowering(StackGrowsDown, Align(2), 0, Align(2)) {}
   void emitPrologue(MachineFunction &, MachineBasicBlock &) const override;
   void emitEpilogue(MachineFunction &, MachineBasicBlock &) const override;
-  bool hasReservedCallFrame(const MachineFunction &) const override { return true; }
+  bool hasReservedCallFrame(const MachineFunction &) const override { return false; }
+  MachineBasicBlock::iterator eliminateCallFramePseudoInstr(MachineFunction &, MachineBasicBlock &, MachineBasicBlock::iterator) const override;
 };
 
 namespace OCISD {
-enum { CALL = ISD::BUILTIN_OP_END, RET, BR_CC, SELECT_CC };
+enum { CALL = ISD::BUILTIN_OP_END, RET, BR_CC, SELECT_CC, RAW_LOAD, RAW_STORE };
 }
 class OpenCPUDAGInfo : public SelectionDAGTargetInfo {
 public:
@@ -124,6 +126,8 @@ public:
     case OCISD::RET: return "OpenCPU::RET";
     case OCISD::BR_CC: return "OpenCPU::BR_CC";
     case OCISD::SELECT_CC: return "OpenCPU::SELECT_CC";
+    case OCISD::RAW_LOAD: return "OpenCPU::RAW_LOAD";
+    case OCISD::RAW_STORE: return "OpenCPU::RAW_STORE";
     default: return nullptr;
     }
   }
@@ -171,7 +175,7 @@ public:
   OpenCPUTargetMachine(const Target &T, const Triple &TT, StringRef CPU, StringRef FS,
       const TargetOptions &Options, std::optional<Reloc::Model> RM,
       std::optional<CodeModel::Model> CM, CodeGenOptLevel OL, bool)
-      : CodeGenTargetMachineImpl(T, Layout, TT, CPU, FS, Options,
+      : CodeGenTargetMachineImpl(T, TT.computeDataLayout(), TT, CPU, FS, Options,
                                  RM.value_or(Reloc::Static), CM.value_or(CodeModel::Small), OL),
         ObjectFile(std::make_unique<TargetLoweringObjectFileELF>()),
         Subtarget(TT, CPU, FS, *this) { initAsmInfo(); }
@@ -192,6 +196,11 @@ void adjustRegister(MachineBasicBlock &MBB, MachineBasicBlock::iterator I,
 
 void OpenCPUInstrInfo::copyPhysReg(MachineBasicBlock &MBB, MachineBasicBlock::iterator I,
     const DebugLoc &DL, Register Dst, Register Src, bool Kill, bool, bool) const {
+  if (Dst == Src) return;
+  if (Src == OpenCPU::ZERO) {
+    BuildMI(MBB, I, DL, get(OpenCPU::LI), Dst).addImm(0);
+    return;
+  }
   BuildMI(MBB, I, DL, get(OpenCPU::MOV), Dst).addReg(Src, getKillRegState(Kill));
 }
 void OpenCPUInstrInfo::storeRegToStackSlot(MachineBasicBlock &MBB,
@@ -216,7 +225,7 @@ void OpenCPUInstrInfo::loadRegFromStackSlot(MachineBasicBlock &MBB,
 
 bool OpenCPURegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator I,
     int SPAdj, unsigned FIOp, RegScavenger *) const {
-  if (SPAdj) reportOpenCPUError("dynamic stack adjustment is unsupported");
+  (void)SPAdj; // All frame references use FP, independent of outgoing arguments.
   MachineInstr &MI = *I;
   if (MI.getOpcode() == TargetOpcode::LIFETIME_START || MI.getOpcode() == TargetOpcode::LIFETIME_END) {
     MI.eraseFromParent();
@@ -228,6 +237,11 @@ bool OpenCPURegisterInfo::eliminateFrameIndex(MachineBasicBlock::iterator I,
   // FP is at the bottom of the allocated frame. Two extra words contain
   // the caller FP/RA; LLVM's object offsets remain standard byte offsets.
   int64_t Bytes = MFI.getObjectOffset(FI) + MFI.getStackSize() + 4 + MI.getOperand(FIOp + 1).getImm();
+  if (MI.getOpcode() == OpenCPU::FRAMEADDR) {
+    MI.getOperand(FIOp).ChangeToRegister(OpenCPU::FP, false);
+    MI.getOperand(FIOp + 1).ChangeToImmediate(Bytes);
+    return false;
+  }
   if (Bytes % 2) reportOpenCPUError("unaligned frame offset");
   int64_t Words = Bytes / 2;
   MI.getOperand(FIOp).ChangeToRegister(OpenCPU::FP, false);
@@ -249,8 +263,10 @@ void OpenCPUFrameLowering::emitPrologue(MachineFunction &MF, MachineBasicBlock &
   auto I = MBB.begin();
   DebugLoc DL;
   uint64_t Bytes = MF.getFrameInfo().getStackSize();
-  if (Bytes % 2 || Bytes > 2040) reportOpenCPUError("static stack frame exceeds the 1024-word RAM or is unaligned");
+  if (Bytes % 2 || Bytes > 2040 || Bytes + 4 + getOpenCPUDataEnd(*MF.getFunction().getParent()) > 2048)
+    reportOpenCPUError("static stack frame and global data exceed the 1024-word RAM or are unaligned");
   adjustRegister(MBB, I, DL, TII, OpenCPU::SP, -int64_t(Bytes / 2 + 2));
+  BuildMI(MBB, I, DL, TII.get(OpenCPU::CHECKSP)).addImm(getOpenCPUDataEnd(*MF.getFunction().getParent()) / 2);
   BuildMI(MBB, I, DL, TII.get(OpenCPU::STORE)).addReg(OpenCPU::FP).addReg(OpenCPU::SP).addImm(0);
   BuildMI(MBB, I, DL, TII.get(OpenCPU::STORE)).addReg(OpenCPU::RA).addReg(OpenCPU::SP).addImm(1);
   BuildMI(MBB, I, DL, TII.get(OpenCPU::MOV), OpenCPU::FP).addReg(OpenCPU::SP);
@@ -263,6 +279,18 @@ void OpenCPUFrameLowering::emitEpilogue(MachineFunction &MF, MachineBasicBlock &
   BuildMI(MBB, I, DL, TII.get(OpenCPU::LOAD), OpenCPU::RA).addReg(OpenCPU::SP).addImm(1);
   BuildMI(MBB, I, DL, TII.get(OpenCPU::LOAD), OpenCPU::FP).addReg(OpenCPU::SP).addImm(0);
   adjustRegister(MBB, I, DL, TII, OpenCPU::SP, MF.getFrameInfo().getStackSize() / 2 + 2);
+}
+
+MachineBasicBlock::iterator OpenCPUFrameLowering::eliminateCallFramePseudoInstr(
+    MachineFunction &MF, MachineBasicBlock &MBB, MachineBasicBlock::iterator I) const {
+  const auto &TII = *MF.getSubtarget().getInstrInfo();
+  int64_t Bytes = I->getOperand(0).getImm();
+  if (Bytes % 2 || Bytes > 2040) reportOpenCPUError("outgoing argument area exceeds RAM");
+  bool Down = I->getOpcode() == OpenCPU::ADJCALLSTACKDOWN;
+  adjustRegister(MBB, I, I->getDebugLoc(), TII, OpenCPU::SP, (Down ? -1 : 1) * Bytes / 2);
+  if (Down && Bytes)
+    BuildMI(MBB, I, I->getDebugLoc(), TII.get(OpenCPU::CHECKSP)).addImm(getOpenCPUDataEnd(*MF.getFunction().getParent()) / 2);
+  return MBB.erase(I);
 }
 
 bool OpenCPUInstrInfo::analyzeBranch(MachineBasicBlock &MBB, MachineBasicBlock *&TBB,
@@ -326,7 +354,8 @@ OpenCPUTargetLowering::OpenCPUTargetLowering(const TargetMachine &TM, const Open
   setOperationAction(ISD::SETCC, MVT::i16, Custom);
   setOperationAction(ISD::SELECT, MVT::i16, Expand);
   setOperationAction(ISD::SELECT_CC, MVT::i16, Custom);
-  setOperationAction(ISD::SIGN_EXTEND_INREG, MVT::i16, Custom);
+  for (MVT From : {MVT::i1, MVT::i8, MVT::i16})
+    setOperationAction(ISD::SIGN_EXTEND_INREG, From, Custom);
   setOperationAction(ISD::SRA, MVT::i16, Custom);
   setOperationAction(ISD::BR_JT, MVT::Other, Expand);
   // Default-legal operations are unsafe on a small target: DAGCombine may
@@ -340,7 +369,9 @@ OpenCPUTargetLowering::OpenCPUTargetLowering(const TargetMachine &TM, const Open
                       ISD::MULHU, ISD::MULHS, ISD::UADDO, ISD::SADDO,
                       ISD::USUBO, ISD::SSUBO, ISD::ADDC, ISD::ADDE,
                       ISD::SUBC, ISD::SUBE, ISD::SADDSAT, ISD::UADDSAT,
-                      ISD::SSUBSAT, ISD::USUBSAT})
+                      ISD::SSUBSAT, ISD::USUBSAT, ISD::UADDO_CARRY, ISD::USUBO_CARRY, ISD::SADDO_CARRY, ISD::SSUBO_CARRY,
+                      ISD::SHL_PARTS, ISD::SRL_PARTS, ISD::SRA_PARTS,
+                      ISD::SMUL_LOHI, ISD::UMUL_LOHI})
     setOperationAction(Op, MVT::i16, Expand);
   setMinFunctionAlignment(Align(2));
   setPrefFunctionAlignment(Align(2));
@@ -383,13 +414,17 @@ SDValue OpenCPUTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) con
   }
   case ISD::SIGN_EXTEND_INREG: {
     EVT From = cast<VTSDNode>(Op.getOperand(1))->getVT();
+    if (From == MVT::i8) {
+      SDValue V = DAG.getNode(ISD::AND, DL, MVT::i16, Op.getOperand(0), DAG.getConstant(255, DL, MVT::i16));
+      SDValue Shifted = DAG.getNode(ISD::XOR, DL, MVT::i16, V, DAG.getConstant(128, DL, MVT::i16));
+      return DAG.getNode(ISD::SUB, DL, MVT::i16, Shifted, DAG.getConstant(128, DL, MVT::i16));
+    }
     if (From != MVT::i1) reportOpenCPUError("unsupported sign extension width");
     SDValue Bit = DAG.getNode(ISD::AND, DL, MVT::i16, Op.getOperand(0), DAG.getConstant(1, DL, MVT::i16));
     return DAG.getNode(ISD::SUB, DL, MVT::i16, DAG.getConstant(0, DL, MVT::i16), Bit);
   }
   case ISD::SRA: {
-    // Used internally when LLVM legalizes sext i1. Source IR ashr remains
-    // rejected, but legalization must never accidentally call a runtime.
+    // Arithmetic shifts and sign extension use only existing ISA operations.
     SDValue V = Op.getOperand(0), N = Op.getOperand(1);
     SDValue Low = DAG.getNode(ISD::SRL, DL, MVT::i16, V, N);
     SDValue Sign = DAG.getNode(OCISD::SELECT_CC, DL, MVT::i16, V,
@@ -405,31 +440,45 @@ SDValue OpenCPUTargetLowering::LowerOperation(SDValue Op, SelectionDAG &DAG) con
   }
 }
 
+static SDValue slotValue(SDValue V, const ISD::ArgFlagsTy &Flags,
+                         const SDLoc &DL, SelectionDAG &DAG) {
+  if (V.getValueType() == MVT::i16) return V;
+  unsigned Op = Flags.isSExt() ? ISD::SIGN_EXTEND : ISD::ZERO_EXTEND;
+  return DAG.getNode(Op, DL, MVT::i16, V);
+}
 SDValue OpenCPUTargetLowering::LowerFormalArguments(SDValue Chain, CallingConv::ID,
     bool VarArg, const SmallVectorImpl<ISD::InputArg> &Ins, const SDLoc &DL,
     SelectionDAG &DAG, SmallVectorImpl<SDValue> &Values) const {
-  if (VarArg || Ins.size() > 4) reportOpenCPUError("at most four i16 arguments are supported");
+  if (VarArg) reportOpenCPUError("variadic functions are unsupported");
   MachineFunction &MF = DAG.getMachineFunction();
   for (unsigned I = 0; I < Ins.size(); ++I) {
-    if (Ins[I].VT != MVT::i16) reportOpenCPUError("function arguments must be i16");
-    Register VReg = MF.addLiveIn(ArgRegs[I], &OpenCPU::GPRRegClass);
-    SDValue V = DAG.getCopyFromReg(Chain, DL, VReg, MVT::i16);
-    Values.push_back(V); Chain = V.getValue(1);
+    SDValue V;
+    if (I < 4) {
+      Register VReg = MF.addLiveIn(ArgRegs[I], &OpenCPU::GPRRegClass);
+      V = DAG.getCopyFromReg(Chain, DL, VReg, MVT::i16);
+    } else {
+      int FI = MF.getFrameInfo().CreateFixedObject(2, (I - 4) * 2, true);
+      V = DAG.getLoad(MVT::i16, DL, Chain, DAG.getFrameIndex(FI, MVT::i16),
+                     MachinePointerInfo::getFixedStack(MF, FI), Align(2));
+    }
+    Chain = V.getValue(1);
+    if (Ins[I].VT != MVT::i16) V = DAG.getNode(ISD::TRUNCATE, DL, Ins[I].VT, V);
+    Values.push_back(V);
   }
   return Chain;
 }
 SDValue OpenCPUTargetLowering::LowerReturn(SDValue Chain, CallingConv::ID, bool,
     const SmallVectorImpl<ISD::OutputArg> &Outs, const SmallVectorImpl<SDValue> &Values,
     const SDLoc &DL, SelectionDAG &DAG) const {
+  if (Outs.size() > 4) reportOpenCPUError("return value exceeds 64 bits");
   SDValue Glue;
-  SmallVector<SDValue, 4> Ops;
-  if (!Outs.empty()) {
-    if (Outs.size() != 1 || Outs[0].VT != MVT::i16) reportOpenCPUError("return value must be i16 or void");
-    Chain = DAG.getCopyToReg(Chain, DL, OpenCPU::A1, Values[0], Glue);
+  SmallVector<SDValue, 8> Ops;
+  for (unsigned I = 0; I < Outs.size(); ++I) {
+    Chain = DAG.getCopyToReg(Chain, DL, ArgRegs[I], slotValue(Values[I], Outs[I].Flags, DL, DAG), Glue);
     Glue = Chain.getValue(1);
   }
   Ops.push_back(Chain);
-  if (!Outs.empty()) Ops.push_back(DAG.getRegister(OpenCPU::A1, MVT::i16));
+  for (unsigned I = 0; I < Outs.size(); ++I) Ops.push_back(DAG.getRegister(ArgRegs[I], MVT::i16));
   if (Glue) Ops.push_back(Glue);
   return DAG.getNode(OCISD::RET, DL, MVT::Other, Ops);
 }
@@ -437,28 +486,52 @@ SDValue OpenCPUTargetLowering::LowerCall(CallLoweringInfo &CLI,
     SmallVectorImpl<SDValue> &Values) const {
   auto &DAG = CLI.DAG;
   auto &DL = CLI.DL;
-  if (CLI.Outs.size() > 4) reportOpenCPUError("at most four call arguments are supported");
   CLI.IsTailCall = false;
-  SDValue Chain = CLI.Chain, Glue;
-  for (unsigned I = 0; I < CLI.OutVals.size(); ++I) {
-    if (CLI.Outs[I].VT != MVT::i16) reportOpenCPUError("call arguments must be i16");
-    Chain = DAG.getCopyToReg(Chain, DL, ArgRegs[I], CLI.OutVals[I], Glue);
+  auto *GA = dyn_cast<GlobalAddressSDNode>(CLI.Callee);
+  if (!GA || !isa<Function>(GA->getGlobal())) reportOpenCPUError("indirect calls are unsupported");
+  const Function *CalleeFunction = cast<Function>(GA->getGlobal());
+  StringRef Name = CalleeFunction->getName();
+  if (Name == "__opencpu_raw_load16" || Name == "__opencpu_mmio_read16") {
+    SDValue V = DAG.getNode(OCISD::RAW_LOAD, DL, DAG.getVTList(MVT::i16, MVT::Other),
+                           CLI.Chain, CLI.OutVals[0]);
+    Values.push_back(V);
+    return V.getValue(1);
+  }
+  if (Name == "__opencpu_raw_store16" || Name == "__opencpu_mmio_write16")
+    return DAG.getNode(OCISD::RAW_STORE, DL, MVT::Other,
+                       CLI.Chain, CLI.OutVals[0], CLI.OutVals[1]);
+  if (CalleeFunction->isDeclaration()) reportOpenCPUError("unresolved function or runtime helper: " + Name);
+  unsigned StackBytes = CLI.Outs.size() > 4 ? (CLI.Outs.size() - 4) * 2 : 0;
+  SDValue Chain = DAG.getCALLSEQ_START(CLI.Chain, StackBytes, 0, DL), Glue;
+  if (StackBytes) {
+    SDValue SP = DAG.getCopyFromReg(Chain, DL, OpenCPU::SP, MVT::i16);
+    Chain = SP.getValue(1);
+    for (unsigned I = 4; I < CLI.OutVals.size(); ++I) {
+      SDValue Address = DAG.getNode(ISD::ADD, DL, MVT::i16, SP, DAG.getConstant(I - 4, DL, MVT::i16));
+      Chain = DAG.getNode(OCISD::RAW_STORE, DL, MVT::Other, Chain, Address,
+                          slotValue(CLI.OutVals[I], CLI.Outs[I].Flags, DL, DAG));
+    }
+  }
+  for (unsigned I = 0; I < std::min<unsigned>(4, CLI.OutVals.size()); ++I) {
+    Chain = DAG.getCopyToReg(Chain, DL, ArgRegs[I], slotValue(CLI.OutVals[I], CLI.Outs[I].Flags, DL, DAG), Glue);
     Glue = Chain.getValue(1);
   }
-  auto *GA = dyn_cast<GlobalAddressSDNode>(CLI.Callee);
-  if (!GA || !isa<Function>(GA->getGlobal()) || cast<Function>(GA->getGlobal())->isDeclaration())
-    reportOpenCPUError("only direct calls to defined module functions are supported; runtime libcalls are unavailable");
   SDValue Callee = DAG.getTargetGlobalAddress(GA->getGlobal(), DL, MVT::i16);
   SmallVector<SDValue, 10> Ops{Chain, Callee};
-  for (unsigned I = 0; I < CLI.OutVals.size(); ++I) Ops.push_back(DAG.getRegister(ArgRegs[I], MVT::i16));
+  for (unsigned I = 0; I < std::min<unsigned>(4, CLI.OutVals.size()); ++I)
+    Ops.push_back(DAG.getRegister(ArgRegs[I], MVT::i16));
   Ops.push_back(DAG.getRegisterMask(DAG.getSubtarget().getRegisterInfo()->getCallPreservedMask(DAG.getMachineFunction(), CLI.CallConv)));
   if (Glue) Ops.push_back(Glue);
   Chain = DAG.getNode(OCISD::CALL, DL, DAG.getVTList(MVT::Other, MVT::Glue), Ops);
   Glue = Chain.getValue(1);
-  if (!CLI.Ins.empty()) {
-    if (CLI.Ins.size() != 1 || CLI.Ins[0].VT != MVT::i16) reportOpenCPUError("call return value must be i16 or void");
-    SDValue V = DAG.getCopyFromReg(Chain, DL, OpenCPU::A1, MVT::i16, Glue);
-    Values.push_back(V); Chain = V.getValue(1);
+  Chain = DAG.getCALLSEQ_END(Chain, StackBytes, 0, Glue, DL);
+  Glue = Chain.getValue(1);
+  if (CLI.Ins.size() > 4) reportOpenCPUError("call return value exceeds 64 bits");
+  for (unsigned I = 0; I < CLI.Ins.size(); ++I) {
+    SDValue V = DAG.getCopyFromReg(Chain, DL, ArgRegs[I], MVT::i16, Glue);
+    Chain = V.getValue(1); Glue = V.getValue(2);
+    if (CLI.Ins[I].VT != MVT::i16) V = DAG.getNode(ISD::TRUNCATE, DL, CLI.Ins[I].VT, V);
+    Values.push_back(V);
   }
   return Chain;
 }
@@ -477,12 +550,12 @@ MachineBasicBlock *OpenCPUTargetLowering::EmitInstrWithCustomInserter(
   Sink->splice(Sink->begin(), Head, std::next(MI.getIterator()), Head->end());
   Sink->transferSuccessorsAndUpdatePHIs(Head);
   BuildMI(*Head, MI, MI.getDebugLoc(), TII.get(OpenCPU::BR_CC))
-      .add(MI.getOperand(1)).add(MI.getOperand(2)).add(MI.getOperand(3)).addMBB(TrueBB);
+      .addReg(MI.getOperand(1).getReg()).addReg(MI.getOperand(2).getReg()).add(MI.getOperand(3)).addMBB(TrueBB);
   BuildMI(*FalseBB, FalseBB->end(), MI.getDebugLoc(), TII.get(OpenCPU::J)).addMBB(Sink);
   Head->addSuccessor(FalseBB); Head->addSuccessor(TrueBB);
   FalseBB->addSuccessor(Sink); TrueBB->addSuccessor(Sink);
   BuildMI(*Sink, Sink->begin(), MI.getDebugLoc(), TII.get(TargetOpcode::PHI), MI.getOperand(0).getReg())
-      .add(MI.getOperand(4)).addMBB(TrueBB).add(MI.getOperand(5)).addMBB(FalseBB);
+      .addReg(MI.getOperand(4).getReg()).addMBB(TrueBB).addReg(MI.getOperand(5).getReg()).addMBB(FalseBB);
   MI.eraseFromParent();
   return Sink;
 }
@@ -513,6 +586,32 @@ void OpenCPUDAGToDAGISel::Select(SDNode *N) {
   if (N->isMachineOpcode()) { N->setNodeId(-1); return; }
   SDLoc DL(N);
   switch (N->getOpcode()) {
+  case ISD::Constant:
+    if (N->getValueType(0) == MVT::i16 && cast<ConstantSDNode>(N)->isZero()) {
+      SDValue Zero = CurDAG->getCopyFromReg(CurDAG->getEntryNode(), DL,
+                                          OpenCPU::ZERO, MVT::i16);
+      ReplaceNode(N, Zero.getNode());
+      return;
+    }
+    break;
+  case ISD::CALLSEQ_START:
+  case ISD::CALLSEQ_END: {
+    SmallVector<SDValue, 4> Ops{N->getOperand(1), N->getOperand(2), N->getOperand(0)};
+    if (N->getNumOperands() > 3) Ops.push_back(N->getOperand(3));
+    CurDAG->SelectNodeTo(N, N->getOpcode() == ISD::CALLSEQ_START ? OpenCPU::ADJCALLSTACKDOWN : OpenCPU::ADJCALLSTACKUP,
+                        CurDAG->getVTList(MVT::Other, MVT::Glue), Ops); return;
+  }
+  case ISD::FrameIndex: {
+    auto *FI = cast<FrameIndexSDNode>(N);
+    CurDAG->SelectNodeTo(N, OpenCPU::FRAMEADDR, MVT::i16,
+      CurDAG->getTargetFrameIndex(FI->getIndex(), MVT::i16), CurDAG->getTargetConstant(0, DL, MVT::i16)); return;
+  }
+  case OCISD::RAW_LOAD:
+    CurDAG->SelectNodeTo(N, OpenCPU::LOAD, CurDAG->getVTList(MVT::i16, MVT::Other),
+      {N->getOperand(1), CurDAG->getTargetConstant(0, DL, MVT::i16), N->getOperand(0)}); return;
+  case OCISD::RAW_STORE:
+    CurDAG->SelectNodeTo(N, OpenCPU::STORE, MVT::Other,
+      {N->getOperand(2), N->getOperand(1), CurDAG->getTargetConstant(0, DL, MVT::i16), N->getOperand(0)}); return;
   case ISD::UNDEF:
     // A concrete zero is a valid choice for LLVM undef; never let an
     // IMPLICIT_DEF pseudo reach the flat assembly writer.
@@ -556,8 +655,9 @@ void OpenCPUDAGToDAGISel::Select(SDNode *N) {
     else CurDAG->SelectNodeTo(N, OpenCPU::RET, MVT::Other, Ops);
     return;
   }
-  default: SelectCode(N); return;
+  default: break;
   }
+  SelectCode(N);
 }
 
 class OpenCPUDAGToDAGISelLegacy : public SelectionDAGISelLegacy {
@@ -568,63 +668,57 @@ public:
 };
 char OpenCPUDAGToDAGISelLegacy::ID;
 
-// The target is intentionally a bounded initial ABI, checked using LLVM's IR
-// types and DataLayout rather than by parsing textual IR in the Python driver.
+// Validate the freestanding scalar ABI after target-specific preparation.
 class OpenCPUValidate : public FunctionPass {
 public:
   static char ID;
   OpenCPUValidate() : FunctionPass(ID) {}
-  StringRef getPassName() const override { return "OpenCPU initial ABI validation"; }
+  StringRef getPassName() const override { return "OpenCPU freestanding ABI validation"; }
   bool runOnFunction(Function &F) override;
   void getAnalysisUsage(AnalysisUsage &AU) const override { AU.setPreservesAll(); }
 };
 char OpenCPUValidate::ID;
 
-uint64_t wordObjectBytes(Type *T) {
-  if (T->isIntegerTy(16)) return 2;
-  if (auto *A = dyn_cast<ArrayType>(T)) {
-    uint64_t Child = wordObjectBytes(A->getElementType());
-    uint64_t Count = A->getNumElements();
-    if (Child && Count && Count <= 2040 / Child) return Child * Count;
-  }
-  return 0;
+static bool supportedScalar(Type *T, bool Void = false) {
+  if (T->isPointerTy() || (Void && T->isVoidTy())) return true;
+  auto *I = dyn_cast<IntegerType>(T);
+  if (!I) return false;
+  unsigned N = I->getBitWidth(); return N == 1 || N == 8 || N == 16 || N == 32 || N == 64;
+}
+static bool supportedObject(Type *T) {
+  if (auto *A = dyn_cast<ArrayType>(T)) return A->getNumElements() && supportedObject(A->getElementType());
+  return supportedScalar(T);
 }
 bool allowedIntrinsic(const Function &F) {
+  if (F.getName() == "__opencpu_raw_load16" || F.getName() == "__opencpu_raw_store16" ||
+      F.getName() == "__opencpu_mmio_read16" || F.getName() == "__opencpu_mmio_write16") return true;
   if (!F.isIntrinsic()) return false;
   return F.getIntrinsicID() == Intrinsic::lifetime_start || F.getIntrinsicID() == Intrinsic::lifetime_end ||
-         F.getName().starts_with("llvm.dbg.");
-}
-void validateFrameAddress(Value *P, const DataLayout &DL, StringRef FunctionName) {
-  int64_t Offset = 0;
-  Value *Base = GetPointerBaseWithConstantOffset(P, Offset, DL);
-  auto *A = dyn_cast<AllocaInst>(Base);
-  if (!A || !isa<ConstantInt>(A->getArraySize())) reportOpenCPUError("memory pointers must derive from a fixed alloca in " + FunctionName);
-  uint64_t Size = wordObjectBytes(A->getAllocatedType());
-  uint64_t Count = cast<ConstantInt>(A->getArraySize())->getValue().getLimitedValue(1021);
-  if (!Size || Count > 2040 / Size || Offset < 0 || Offset % 2 || uint64_t(Offset) + 2 > Size * Count)
-    reportOpenCPUError("frame access is unaligned or outside its allocated object in " + FunctionName);
+         F.getIntrinsicID() == Intrinsic::assume || F.getName().starts_with("llvm.dbg.");
 }
 bool OpenCPUValidate::runOnFunction(Function &F) {
   Module &M = *F.getParent();
-  if (!M.global_empty() || !M.alias_empty() || !M.ifunc_empty()) reportOpenCPUError("global data, aliases and indirect functions are unsupported");
-  if (!M.getModuleInlineAsm().empty()) reportOpenCPUError("module inline assembly is unsupported");
-  for (Function &Other : M)
-    if (Other.isDeclaration() && !allowedIntrinsic(Other))
-      reportOpenCPUError("external functions are unsupported");
   Function *Main = M.getFunction("main");
   if (!Main || Main->isDeclaration() || !Main->arg_empty() ||
       !(Main->getReturnType()->isIntegerTy(16) || Main->getReturnType()->isVoidTy()))
     reportOpenCPUError("module must define main() returning i16 or void");
-  if (F.isDeclaration()) { if (!allowedIntrinsic(F)) reportOpenCPUError("external functions are unsupported"); return false; }
-  if (F.getName().empty()) reportOpenCPUError("functions require assembly-compatible names");
-  if (F.getName() == "_start" || F.getName().starts_with(".Locpu")) reportOpenCPUError("reserved function name");
-  if (F.getCallingConv() != CallingConv::C || F.isVarArg() || F.arg_size() > 4 ||
-      !(F.getReturnType()->isIntegerTy(16) || F.getReturnType()->isVoidTy()))
-    reportOpenCPUError("functions require C calling convention, up to four i16 arguments and i16/void return");
+  if (F.isDeclaration()) {
+    if (!F.use_empty() && !allowedIntrinsic(F)) reportOpenCPUError("unresolved external function: " + F.getName());
+    return false;
+  }
+  if (F.getName().empty() || F.getName() == "_start" || F.getName().starts_with(".Locpu"))
+    reportOpenCPUError("reserved or unrepresentable function name");
   for (char C : F.getName())
-    if (!(std::isalnum(static_cast<unsigned char>(C)) || C == '_' || C == '.' || C == '$')) reportOpenCPUError("function name is not representable in OpenCPU assembly");
-  if (!F.getName().empty() && std::isdigit(static_cast<unsigned char>(F.getName().front()))) reportOpenCPUError("function name cannot start with a digit");
-  for (Argument &A : F.args()) if (!A.getType()->isIntegerTy(16)) reportOpenCPUError("function arguments must be i16");
+    if (!(std::isalnum(static_cast<unsigned char>(C)) || C == '_' || C == '.' || C == '$'))
+      reportOpenCPUError("function name is not representable in OpenCPU assembly");
+  if (std::isdigit(static_cast<unsigned char>(F.getName().front()))) reportOpenCPUError("function name cannot start with a digit");
+  if (F.getCallingConv() != CallingConv::C || F.isVarArg() || !supportedScalar(F.getReturnType(), true))
+    reportOpenCPUError("functions require C calling convention and scalar integer/pointer parameters and return values");
+  for (Argument &A : F.args()) {
+    if (!supportedScalar(A.getType())) reportOpenCPUError("unsupported function argument type");
+    if (A.hasByValAttr() || A.hasStructRetAttr() || A.hasInAllocaAttr() || A.hasByRefAttr())
+      reportOpenCPUError("aggregate arguments and returns are unsupported");
+  }
   const DataLayout &DL = M.getDataLayout();
   if (DL.getPointerSizeInBits() != 16 || DL.getTypeAllocSize(Type::getInt16Ty(F.getContext())) != 2)
     reportOpenCPUError("incompatible module data layout");
@@ -632,58 +726,49 @@ bool OpenCPUValidate::runOnFunction(Function &F) {
     if (auto *CB = dyn_cast<CallInst>(&I)) {
       Function *Callee = CB->getCalledFunction();
       if (!Callee) reportOpenCPUError("indirect calls and inline assembly are unsupported");
-      if (allowedIntrinsic(*Callee)) continue;
-      if (Callee->isDeclaration()) reportOpenCPUError("external functions are unsupported");
-      if (CB->isMustTailCall() || CB->getCallingConv() != CallingConv::C) reportOpenCPUError("tail-call requirements and custom calling conventions are unsupported");
-      if (CB->arg_size() > 4 || CB->getFunctionType() != Callee->getFunctionType() ||
-          !(CB->getType()->isIntegerTy(16) || CB->getType()->isVoidTy()))
-        reportOpenCPUError("call signature must match a function with up to four i16 arguments and i16/void return");
-      for (Value *Argument : CB->args())
-        if (!Argument->getType()->isIntegerTy(16)) reportOpenCPUError("call arguments must be i16");
+      if (CB->isMustTailCall() || CB->getCallingConv() != CallingConv::C ||
+          CB->getFunctionType() != Callee->getFunctionType()) reportOpenCPUError("incompatible call signature or calling convention");
+      if (allowedIntrinsic(*Callee)) {
+        StringRef Name = Callee->getName();
+        if (Name.starts_with("__opencpu_")) {
+          bool Read = Name.ends_with("load16") || Name.ends_with("read16");
+          unsigned Count = Read ? 1 : 2;
+          if (CB->arg_size() != Count || (Read ? !CB->getType()->isIntegerTy(16) : !CB->getType()->isVoidTy()))
+            reportOpenCPUError("invalid raw-memory or MMIO signature");
+          for (Value *A : CB->args()) if (!A->getType()->isIntegerTy(16))
+            reportOpenCPUError("raw-memory and MMIO operands must be i16");
+        }
+        continue;
+      }
+      if (Callee->isDeclaration()) reportOpenCPUError("unresolved external function: " + Callee->getName());
+      if (!supportedScalar(CB->getType(), true)) reportOpenCPUError("unsupported call result type");
+      for (Value *A : CB->args()) if (!supportedScalar(A->getType())) reportOpenCPUError("unsupported call argument type");
       continue;
     }
     if (auto *A = dyn_cast<AllocaInst>(&I)) {
       auto *Count = dyn_cast<ConstantInt>(A->getArraySize());
-      uint64_t Size = wordObjectBytes(A->getAllocatedType());
-      if (!Count || Count->isZero() || !Size) reportOpenCPUError("alloca must have a fixed, bounded nonzero i16 object type");
-      if (A->getAlign() != Align(2) || Count->getValue().getLimitedValue(1021) > 2040 / Size)
-        reportOpenCPUError("alloca alignment or total size exceeds the initial ABI");
+      if (!Count || Count->isZero() || !supportedObject(A->getAllocatedType()) || A->getAlign() > Align(2))
+        reportOpenCPUError("alloca requires a fixed integer/pointer object aligned to at most two bytes");
+      uint64_t Size = DL.getTypeAllocSize(A->getAllocatedType());
+      if (Size > 2040 || Count->getValue().getLimitedValue(2041) > 2040 / Size)
+        reportOpenCPUError("static stack object exceeds RAM");
       continue;
     }
-    if (auto *G = dyn_cast<GetElementPtrInst>(&I)) {
-      for (Value *Index : G->indices()) if (!isa<ConstantInt>(Index)) reportOpenCPUError("dynamic GEP indices are unsupported");
-      int64_t Offset = 0;
-      if (!isa<AllocaInst>(GetPointerBaseWithConstantOffset(G, Offset, DL)) || Offset % 2)
-        reportOpenCPUError("GEP must be an aligned constant frame address");
-      continue;
-    }
-    if (auto *L = dyn_cast<LoadInst>(&I)) {
-      if (!L->getType()->isIntegerTy(16) || L->isAtomic() || L->getAlign() != Align(2)) reportOpenCPUError("load requires aligned, non-atomic i16 memory");
-      validateFrameAddress(L->getPointerOperand(), DL, F.getName()); continue;
-    }
-    if (auto *S = dyn_cast<StoreInst>(&I)) {
-      if (!S->getValueOperand()->getType()->isIntegerTy(16) || S->isAtomic() || S->getAlign() != Align(2)) reportOpenCPUError("store requires aligned, non-atomic i16 memory");
-      validateFrameAddress(S->getPointerOperand(), DL, F.getName()); continue;
-    }
+    if (isa<GetElementPtrInst>(I)) continue;
     switch (I.getOpcode()) {
     case Instruction::Add: case Instruction::Sub: case Instruction::Mul:
     case Instruction::And: case Instruction::Or: case Instruction::Xor:
-    case Instruction::Shl: case Instruction::LShr:
-      if (!I.getType()->isIntegerTy(16)) reportOpenCPUError("arithmetic values must be i16");
+    case Instruction::Shl: case Instruction::LShr: case Instruction::AShr:
+    case Instruction::ICmp: case Instruction::PHI: case Instruction::Select:
+    case Instruction::ZExt: case Instruction::SExt: case Instruction::Trunc:
+    case Instruction::PtrToInt: case Instruction::IntToPtr: case Instruction::BitCast:
+    case Instruction::Freeze:
+      if (!supportedScalar(I.getType())) reportOpenCPUError("unsupported scalar width or floating-point operation");
+      for (Value *V : I.operands())
+        if (!isa<BasicBlock>(V) && !supportedScalar(V->getType())) reportOpenCPUError("unsupported operand type");
       break;
-    case Instruction::ICmp:
-      if (!I.getOperand(0)->getType()->isIntegerTy(16)) reportOpenCPUError("icmp operands must be i16");
-      break;
-    case Instruction::PHI: case Instruction::Select:
-      if (!(I.getType()->isIntegerTy(16) || I.getType()->isIntegerTy(1))) reportOpenCPUError("phi/select values must be i16 or i1");
-      break;
-    case Instruction::ZExt: case Instruction::SExt:
-      if (!I.getOperand(0)->getType()->isIntegerTy(1) || !I.getType()->isIntegerTy(16)) reportOpenCPUError("extensions must convert i1 to i16");
-      break;
-    case Instruction::Trunc:
-      if (!I.getOperand(0)->getType()->isIntegerTy(16) || !I.getType()->isIntegerTy(1)) reportOpenCPUError("trunc must convert i16 to i1");
-      break;
-    case Instruction::UncondBr: case Instruction::CondBr: case Instruction::Ret: break;
+    case Instruction::UncondBr: case Instruction::CondBr: case Instruction::Ret:
+    case Instruction::Unreachable: break;
     default: reportOpenCPUError(Twine("unsupported IR instruction: ") + I.getOpcodeName());
     }
   }
@@ -693,7 +778,19 @@ bool OpenCPUValidate::runOnFunction(Function &F) {
 class OpenCPUPassConfig : public TargetPassConfig {
 public:
   OpenCPUPassConfig(OpenCPUTargetMachine &TM, PassManagerBase &PM) : TargetPassConfig(TM, PM) {}
-  void addIRPasses() override { addPass(new OpenCPUValidate); TargetPassConfig::addIRPasses(); }
+  void addIRPasses() override {
+    addPass(createPromoteMemoryToRegisterPass());
+    addPass(createCFGSimplificationPass());
+    addPass(createLowerSwitchPass());
+    addPass(createOpenCPUPreparePass());
+    addPass(createGlobalDCEPass());
+    addPass(new OpenCPUValidate);
+    TargetPassConfig::addIRPasses();
+  }
+  // Four allocatable registers make local fast allocation needlessly exceed
+  // the board ROM for wide runtime routines. Coalescing/greedy allocation is
+  // required even with -O0; source-level optimizations remain disabled.
+  void addFastRegAlloc() override { addOptimizedRegAlloc(); }
   bool addInstSelector() override {
     addPass(new OpenCPUDAGToDAGISelLegacy(getTM<OpenCPUTargetMachine>(), getOptLevel()));
     return false;

@@ -5,6 +5,6 @@
 using namespace llvm;
 Target &llvm::getTheOpenCPUTarget() { static Target T; return T; }
 extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeOpenCPUTargetInfo() {
-  RegisterTarget<Triple::UnknownArch> X(getTheOpenCPUTarget(), "opencpu",
-                                       "OpenCPU ISA v2 (i16 experimental)", "OpenCPU");
+  RegisterTarget<Triple::opencpu> X(getTheOpenCPUTarget(), "opencpu",
+                                       "OpenCPU ISA v2 (LLVM ABI v2)", "OpenCPU");
 }

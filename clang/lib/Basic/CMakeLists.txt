@@ -108,6 +108,7 @@ add_clang_library(clangBasic
   Targets/LoongArch.cpp
   Targets/M68k.cpp
   Targets/MSP430.cpp
+  Targets/OpenCPU.cpp
   Targets/Mips.cpp
   Targets/NVPTX.cpp
   Targets/OSTargets.cpp

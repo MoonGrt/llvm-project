@@ -17,6 +17,18 @@ using namespace llvm;
 
 namespace {
 
+TEST(TripleTest, OpenCPU) {
+  Triple T("opencpu-unknown-none");
+  EXPECT_EQ(Triple::opencpu, T.getArch());
+  EXPECT_TRUE(T.isArch16Bit());
+  EXPECT_TRUE(T.isLittleEndian());
+  EXPECT_TRUE(T.isOSBinFormatELF());
+  EXPECT_EQ(ExceptionHandling::None, T.getDefaultExceptionHandling());
+  EXPECT_EQ("opencpu", Triple::getArchTypeName(T.getArch()));
+  EXPECT_EQ("e-m:e-p:16:16-i32:16-i64:16-f32:16-f64:16-n16-S16",
+            T.computeDataLayout());
+}
+
 TEST(TripleTest, BasicParsing) {
   Triple T;
 

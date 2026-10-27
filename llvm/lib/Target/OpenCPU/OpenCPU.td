@@ -4,7 +4,7 @@ class OCReg<string name, bits<16> encoding> : Register<name> {
   let Namespace = "OpenCPU";
   let HWEncoding = encoding;
 }
-def ZERO : OCReg<"zero", 0>;
+def ZERO : OCReg<"zero", 0> { let isConstant = true; }
 def A1 : OCReg<"a1", 1>;
 def A2 : OCReg<"a2", 2>;
 def A3 : OCReg<"a3", 3>;
@@ -41,7 +41,31 @@ def XOR : Binary<xor, "xor">;
 def SHL : Binary<shl, "sll">;
 def SRL : Binary<srl, "srl">;
 def LI : OCInst<(outs GPR:$dst), (ins i16imm:$value), "li $dst, $value",
-                [(set GPR:$dst, imm:$value)]>;
+                [(set GPR:$dst, imm:$value)]> {
+  let isReMaterializable = 1;
+  let isAsCheapAsAMove = 1;
+}
+def FRAMEADDR : OCInst<(outs GPR:$dst), (ins GPR:$base, i16imm:$offset), ""> {
+  let isPseudo = 1;
+}
+def CHECKSP : OCInst<(outs), (ins i16imm:$limit), ""> {
+  let isPseudo = 1;
+  let hasSideEffects = 1;
+  let Uses = [SP];
+  let Defs = [SP];
+}
+def ADJCALLSTACKDOWN : OCInst<(outs), (ins i16imm:$amt, i16imm:$unused), ""> {
+  let isPseudo = 1;
+  let hasSideEffects = 1;
+  let Uses = [SP];
+  let Defs = [SP];
+}
+def ADJCALLSTACKUP : OCInst<(outs), (ins i16imm:$amt, i16imm:$unused), ""> {
+  let isPseudo = 1;
+  let hasSideEffects = 1;
+  let Uses = [SP];
+  let Defs = [SP];
+}
 def MOV : OCInst<(outs GPR:$dst), (ins GPR:$src), "mov $dst, $src">;
 def ADDI : OCInst<(outs GPR:$dst), (ins GPR:$src, i16imm:$value), "addi $dst, $value"> {
   let Constraints = "$dst = $src";

@@ -8,8 +8,9 @@ tablegen(LLVM OpenCPUGenSDNodeInfo.inc -gen-sd-node-info)
 add_public_tablegen_target(OpenCPUCommonTableGen)
 add_llvm_target(OpenCPUCodeGen
   OpenCPU.cpp
+  OpenCPUPrepare.cpp
   OpenCPUAsmPrinter.cpp
-  LINK_COMPONENTS Analysis AsmPrinter CodeGen CodeGenTypes Core MC
+  LINK_COMPONENTS Analysis AsmParser BitReader IRReader Linker IPO InstCombine AsmPrinter CodeGen CodeGenTypes Core MC
   OpenCPUDesc OpenCPUInfo Scalar SelectionDAG Support Target TargetParser TransformUtils
   ADD_TO_COMPONENT OpenCPU
 )

@@ -481,6 +481,15 @@ namespace clang {
     };
   }
 
+  namespace OpenCPU {
+  enum {
+    LastTIBuiltin = clang::Builtin::FirstTSBuiltin - 1,
+#define BUILTIN(ID, TYPE, ATTRS) BI##ID,
+#include "clang/Basic/BuiltinsOpenCPU.def"
+    LastTSBuiltin
+  };
+  } // namespace OpenCPU
+
   /// AVR builtins
   namespace AVR {
   enum {
@@ -496,7 +505,7 @@ namespace clang {
        PPC::LastTSBuiltin, NVPTX::LastTSBuiltin, AMDGPU::LastTSBuiltin,
        X86::LastTSBuiltin, VE::LastTSBuiltin, RISCV::LastTSBuiltin,
        Hexagon::LastTSBuiltin, Mips::LastTSBuiltin, XCore::LastTSBuiltin,
-       SystemZ::LastTSBuiltin, WebAssembly::LastTSBuiltin, AVR::LastTSBuiltin});
+       SystemZ::LastTSBuiltin, WebAssembly::LastTSBuiltin, AVR::LastTSBuiltin, OpenCPU::LastTSBuiltin});
 
 } // end namespace clang.
 
