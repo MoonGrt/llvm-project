@@ -1,0 +1,2 @@
+add_llvm_component_library(LLVMOpenCPUDesc OpenCPUMCTargetDesc.cpp
+  LINK_COMPONENTS MC OpenCPUInfo Support ADD_TO_COMPONENT OpenCPU)
